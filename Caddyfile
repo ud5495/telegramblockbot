@@ -1,0 +1,9 @@
+# Caddy obtains and renews a Let's Encrypt certificate automatically.
+# Set WEBHOOK_DOMAIN in your environment (or .env next to docker-compose.yml),
+# e.g. WEBHOOK_DOMAIN=bot.example.com
+#
+# The bot listens on 8443 inside the compose network.
+{$WEBHOOK_DOMAIN} {
+	encode gzip
+	reverse_proxy bot:8443
+}
