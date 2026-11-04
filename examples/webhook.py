@@ -2,7 +2,7 @@
 
 Telegram pushes updates to an HTTPS endpoint instead of the bot polling. You
 need a public host with a valid TLS certificate and a domain. Telegram only
-delivers webhooks on ports 443, 80, 88 or 8443.
+delivers webhooks on public ports 443 (the default), 80, 88 or 8443.
 
 Two common setups:
 
@@ -15,10 +15,10 @@ Run from the repository root:
 
     export BOT_TOKEN="123456:your-token"
     export WEBHOOK_URL="https://bot.example.com/telegram"
-    export WEBHOOK_SECRET="a-long-random-string"
+    export WEBHOOK_SECRET="replace-with-32-or-more-random-characters"
     export WEBHOOK_PORT=8443
     export WEBHOOK_PATH=/telegram
-    python examples/webhook.py
+    python -m examples.webhook
 """
 
 from __future__ import annotations
@@ -28,6 +28,8 @@ import os
 
 from telegram import Update
 from telegram.ext import Application, ContextTypes, MessageHandler, filters
+
+from bot.config import ConfigError, load_settings
 
 LINK_MARKERS = ("http://", "https://", "www.", "t.me/", "telegram.me/")
 
@@ -45,22 +47,15 @@ async def remove_links(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 def main() -> None:
-    token = os.environ.get("BOT_TOKEN")
-    webhook_url = os.environ.get("WEBHOOK_URL")
-    if not token:
-        raise SystemExit("Set BOT_TOKEN")
-    if not webhook_url or not webhook_url.startswith("https://"):
-        raise SystemExit("Set WEBHOOK_URL to a public https:// URL")
-
-    listen = os.environ.get("WEBHOOK_LISTEN", "0.0.0.0")
-    port = int(os.environ.get("WEBHOOK_PORT", "8443"))
-    url_path = os.environ.get("WEBHOOK_PATH", "/telegram").lstrip("/")
-    secret_token = os.environ.get("WEBHOOK_SECRET") or None
-    cert = os.environ.get("WEBHOOK_CERT") or None
-    key = os.environ.get("WEBHOOK_KEY") or None
+    env = os.environ.copy()
+    env["MODE"] = "webhook"
+    try:
+        settings = load_settings(env)
+    except ConfigError as exc:
+        raise SystemExit(f"Configuration error: {exc}") from exc
 
     logging.basicConfig(level=logging.INFO)
-    application = Application.builder().token(token).build()
+    application = Application.builder().token(settings.bot_token).build()
     application.add_handler(
         MessageHandler(
             (filters.TEXT | filters.CAPTION) & ~filters.COMMAND, remove_links
@@ -68,13 +63,13 @@ def main() -> None:
     )
 
     application.run_webhook(
-        listen=listen,
-        port=port,
-        url_path=url_path,
-        webhook_url=webhook_url,
-        secret_token=secret_token,
-        cert=cert,
-        key=key,
+        listen=settings.webhook_listen,
+        port=settings.webhook_port,
+        url_path=settings.webhook_path.lstrip("/"),
+        webhook_url=settings.webhook_url,
+        secret_token=settings.webhook_secret,
+        cert=settings.webhook_cert,
+        key=settings.webhook_key,
         drop_pending_updates=True,
     )
 

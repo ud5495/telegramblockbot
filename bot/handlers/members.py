@@ -36,34 +36,186 @@ async def on_new_members(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         if member.is_bot:
             continue
         try:
-            await moderation.mute_user(
-                context.bot, chat.id, member.id, settings.captcha_timeout
+            attempt_id = await db.add_pending_captcha(
+                chat.id,
+                member.id,
+                None,
+                time.time() + settings.captcha_timeout,
             )
+        except Exception:
+            logger.exception("Could not create captcha attempt for %s", member.id)
+            continue
+
+        try:
+            await moderation.mute_captcha_user(context.bot, chat.id, member.id)
         except TelegramError as exc:
+            await db.remove_captcha_attempt(chat.id, member.id, attempt_id)
             logger.warning(
                 "Could not mute new member %s for captcha: %s", member.id, exc
             )
             continue
 
-        try:
-            prompt = await context.bot.send_message(
-                chat_id=chat.id,
-                text=messages.CAPTCHA_PROMPT.format(
-                    name=member.mention_html(), timeout=settings.captcha_timeout
-                ),
-                parse_mode="HTML",
-                reply_markup=captcha_keyboard(chat.id, member.id),
+        row = await db.get_pending_captcha(chat.id, member.id)
+        if row is not None and row["attempt_id"] == attempt_id:
+            await _send_captcha_prompt(
+                context,
+                row,
+                member.mention_html(),
+                settings.captcha_timeout,
+                lease_held=True,
+                ensure_muted=False,
             )
-        except TelegramError as exc:
-            logger.warning("Could not send captcha prompt to %s: %s", member.id, exc)
-            continue
 
-        await db.add_pending_captcha(
-            chat.id,
-            member.id,
-            prompt.message_id,
-            time.time() + settings.captcha_timeout,
+
+async def _send_captcha_prompt(
+    context: ContextTypes.DEFAULT_TYPE,
+    row: dict,
+    name: str,
+    timeout: int,
+    lease_held: bool = False,
+    ensure_muted: bool = True,
+) -> bool:
+    db = database_of(context)
+    chat_id = row["chat_id"]
+    user_id = row["user_id"]
+    attempt_id = row["attempt_id"]
+    now = time.time()
+    if not lease_held and not await db.claim_captcha_prompt(
+        chat_id, user_id, attempt_id, now
+    ):
+        return False
+
+    if ensure_muted:
+        try:
+            # A recovered setup row may have crashed before its first mute.
+            await moderation.mute_captcha_user(context.bot, chat_id, user_id)
+        except TelegramError as exc:
+            await db.release_captcha_lease(chat_id, user_id, attempt_id, "pending")
+            logger.warning("Could not restore captcha mute for %s: %s", user_id, exc)
+            return False
+
+    try:
+        prompt = await context.bot.send_message(
+            chat_id=chat_id,
+            text=messages.CAPTCHA_PROMPT.format(name=name, timeout=timeout),
+            parse_mode="HTML",
+            reply_markup=captcha_keyboard(chat_id, user_id, attempt_id),
         )
+    except TelegramError as exc:
+        await db.release_captcha_lease(chat_id, user_id, attempt_id, "pending")
+        logger.warning("Could not send captcha prompt to %s: %s", user_id, exc)
+        return False
+
+    try:
+        # A later sweep can resend if this update cannot be saved.
+        return await db.set_pending_captcha_message(
+            chat_id, user_id, attempt_id, prompt.message_id
+        )
+    except Exception:
+        await db.release_captcha_lease(chat_id, user_id, attempt_id, "pending")
+        logger.exception("Could not save captcha prompt for %s", user_id)
+        return False
+
+
+async def _finish_captcha_pass(
+    context: ContextTypes.DEFAULT_TYPE, row: dict
+) -> bool:
+    db = database_of(context)
+    chat_id = row["chat_id"]
+    user_id = row["user_id"]
+    attempt_id = row["attempt_id"]
+
+    if row["status"] == "passed":
+        return await _complete_captcha_pass(db, chat_id, user_id, attempt_id)
+    if row["status"] not in {"pending", "passing"}:
+        return False
+    if not await db.claim_captcha_pass(
+        chat_id, user_id, attempt_id, time.time()
+    ):
+        return False
+
+    try:
+        await moderation.unmute_user(context.bot, chat_id, user_id)
+    except TelegramError as exc:
+        await db.release_captcha_lease(chat_id, user_id, attempt_id, "passing")
+        logger.warning("Could not unmute verified user %s: %s", user_id, exc)
+        return False
+
+    if not await db.mark_captcha_passed(chat_id, user_id, attempt_id):
+        return False
+    return await _complete_captcha_pass(db, chat_id, user_id, attempt_id)
+
+
+async def _complete_captcha_pass(
+    db, chat_id: int, user_id: int, attempt_id: str
+) -> bool:
+    try:
+        return await db.complete_captcha_pass(chat_id, user_id, attempt_id)
+    except Exception:
+        # The passed row prevents another unmute; only DB completion is retried.
+        logger.exception("Could not finalize passed captcha for %s", user_id)
+        return False
+
+
+async def _enforce_captcha_timeout(
+    context: ContextTypes.DEFAULT_TYPE, row: dict
+) -> bool:
+    db = database_of(context)
+    chat_id = row["chat_id"]
+    user_id = row["user_id"]
+    attempt_id = row["attempt_id"]
+
+    if row["status"] == "enforced":
+        return await _complete_captcha_failure(
+            context, db, chat_id, user_id, attempt_id, row
+        )
+    if row["status"] not in {"pending", "expired"}:
+        return False
+    if not await db.mark_captcha_expired(
+        chat_id, user_id, attempt_id, time.time()
+    ):
+        return False
+
+    kick = settings_of(context).captcha_kick_on_timeout
+    try:
+        if kick:
+            await moderation.kick_user(context.bot, chat_id, user_id)
+        else:
+            # Without kick-on-timeout, expiry itself must explicitly unmute.
+            await moderation.unmute_user(context.bot, chat_id, user_id)
+    except TelegramError as exc:
+        await db.release_captcha_lease(chat_id, user_id, attempt_id, "expired")
+        action = "kick" if kick else "unmute"
+        logger.warning("Could not %s unverified user %s: %s", action, user_id, exc)
+        return False
+
+    if not await db.mark_captcha_enforced(chat_id, user_id, attempt_id):
+        return False
+    return await _complete_captcha_failure(
+        context, db, chat_id, user_id, attempt_id, row
+    )
+
+
+async def _complete_captcha_failure(
+    context: ContextTypes.DEFAULT_TYPE,
+    db,
+    chat_id: int,
+    user_id: int,
+    attempt_id: str,
+    row: dict,
+) -> bool:
+    try:
+        completed = await db.complete_captcha_failure(chat_id, user_id, attempt_id)
+    except Exception:
+        # The enforced row prevents another kick/unmute on the next sweep.
+        logger.exception("Could not finalize expired captcha for %s", user_id)
+        return False
+    if completed and row.get("message_id"):
+        try:
+            await context.bot.delete_message(row["chat_id"], row["message_id"])
+        except TelegramError:
+            pass
+    return completed
 
 
 async def on_captcha_callback(
@@ -73,8 +225,12 @@ async def on_captcha_callback(
     if query is None or not query.data:
         return
     parts = query.data.split(":")
-    if len(parts) != 3:
-        await query.answer()
+    if (
+        len(parts) not in {3, 4}
+        or parts[0] != "captcha"
+        or (len(parts) == 4 and not parts[3])
+    ):
+        await query.answer(messages.CAPTCHA_EXPIRED, show_alert=True)
         return
 
     try:
@@ -83,6 +239,7 @@ async def on_captcha_callback(
     except ValueError:
         await query.answer()
         return
+    attempt_id = parts[3] if len(parts) == 4 else None
 
     user = update.effective_user
     if user is None or user.id != target_user_id:
@@ -91,18 +248,47 @@ async def on_captcha_callback(
 
     db = database_of(context)
     pending = await db.get_pending_captcha(chat_id, user.id)
-    if pending is None or pending["expires_at"] < time.time():
-        await db.remove_pending_captcha(chat_id, user.id)
+    callback_message = getattr(query, "message", None)
+    if pending is None or callback_message is None:
+        await query.answer(messages.CAPTCHA_EXPIRED, show_alert=True)
+        return
+    if attempt_id is None:
+        # Three-part callbacks are accepted only for their original legacy row.
+        if (
+            not pending["legacy"]
+            or pending["message_id"] is None
+            or callback_message.message_id != pending["message_id"]
+        ):
+            await query.answer(messages.CAPTCHA_EXPIRED, show_alert=True)
+            return
+    elif (
+        pending["attempt_id"] != attempt_id
+        or pending["message_id"] is None
+        or callback_message.message_id != pending["message_id"]
+    ):
+        # An old prompt must never verify a replacement or unprompted attempt.
         await query.answer(messages.CAPTCHA_EXPIRED, show_alert=True)
         return
 
-    await db.remove_pending_captcha(chat_id, user.id)
-    try:
-        await moderation.unmute_user(context.bot, chat_id, user.id)
-    except TelegramError as exc:
-        logger.warning("Could not unmute verified user %s: %s", user.id, exc)
+    now = time.time()
+    if pending["status"] in {"expired", "enforced"} or (
+        pending["status"] == "pending" and pending["expires_at"] <= now
+    ):
+        completed = await _enforce_captcha_timeout(context, pending)
+        await query.answer(
+            messages.CAPTCHA_EXPIRED if completed else messages.CAPTCHA_RETRY,
+            show_alert=True,
+        )
+        return
 
-    await db.increment_stat(chat_id, "captcha_passed")
+    if pending["status"] not in {"pending", "passing", "passed"}:
+        await query.answer(messages.CAPTCHA_RETRY, show_alert=True)
+        return
+
+    if not await _finish_captcha_pass(context, pending):
+        await query.answer(messages.CAPTCHA_RETRY, show_alert=True)
+        return
+
     await query.answer(messages.CAPTCHA_PASSED)
     try:
         await query.edit_message_text(messages.CAPTCHA_PASSED)
@@ -111,26 +297,27 @@ async def on_captcha_callback(
 
 
 async def captcha_sweep(context: ContextTypes.DEFAULT_TYPE) -> None:
-    settings = settings_of(context)
     db = database_of(context)
-    expired = await db.expired_captchas(time.time())
-    for row in expired:
-        chat_id = row["chat_id"]
-        user_id = row["user_id"]
-        await db.remove_pending_captcha(chat_id, user_id)
-        await db.increment_stat(chat_id, "captcha_failed")
-
-        if row.get("message_id"):
-            try:
-                await context.bot.delete_message(chat_id, row["message_id"])
-            except TelegramError:
-                pass
-
-        if settings.captcha_kick_on_timeout:
-            try:
-                await moderation.kick_user(context.bot, chat_id, user_id)
-            except TelegramError as exc:
-                logger.warning("Could not kick unverified user %s: %s", user_id, exc)
+    settings = settings_of(context)
+    actionable = await db.expired_captchas(time.time())
+    for row in actionable:
+        if row["status"] == "pending" and row["expires_at"] > time.time():
+            await _send_captcha_prompt(
+                context, row, "there", settings.captcha_timeout
+            )
+            continue
+        if row["status"] in {"passing", "passed"}:
+            if await _finish_captcha_pass(context, row) and row.get("message_id"):
+                try:
+                    await context.bot.edit_message_text(
+                        chat_id=row["chat_id"],
+                        message_id=row["message_id"],
+                        text=messages.CAPTCHA_PASSED,
+                    )
+                except TelegramError:
+                    pass
+            continue
+        await _enforce_captcha_timeout(context, row)
 
 
 async def on_chat_member_update(

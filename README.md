@@ -58,10 +58,10 @@ obtains TLS automatically:
 # .env
 MODE=webhook
 WEBHOOK_URL=https://bot.example.com/telegram
-WEBHOOK_LISTEN=127.0.0.1
+WEBHOOK_LISTEN=0.0.0.0
 WEBHOOK_PORT=8443
 WEBHOOK_PATH=/telegram
-WEBHOOK_SECRET=<long-random-string>
+WEBHOOK_SECRET=replace-with-32-or-more-random-characters
 WEBHOOK_DOMAIN=bot.example.com   # used by Caddy in Docker
 ```
 
@@ -98,11 +98,11 @@ All settings come from environment variables (or `.env`). See `.env.example`.
 | `CAPTCHA_TIMEOUT` | `120` | Seconds to solve the captcha |
 | `CAPTCHA_KICK_ON_TIMEOUT` | `true` | Kick users who fail the captcha |
 | `AUDIT_CHAT_ID` | — | Chat id that receives audit messages |
-| `WEBHOOK_URL` | — | Public HTTPS URL (webhook mode) |
-| `WEBHOOK_LISTEN` | `0.0.0.0` | Webhook bind address |
-| `WEBHOOK_PORT` | `8443` | Webhook bind port |
-| `WEBHOOK_PATH` | `/telegram` | Webhook URL path |
-| `WEBHOOK_SECRET` | — | Secret token header validation |
+| `WEBHOOK_URL` | — | HTTPS URL with hostname; ports: `443` (default), `80`, `88`, `8443`; no query/fragment |
+| `WEBHOOK_LISTEN` | `0.0.0.0` | Webhook bind address; must be `0.0.0.0` for Compose + Caddy |
+| `WEBHOOK_PORT` | `8443` | Local webhook bind port (`1`–`65535`) |
+| `WEBHOOK_PATH` | `/telegram` | Must exactly match the public `WEBHOOK_URL` path |
+| `WEBHOOK_SECRET` | — | Required for webhooks: 32–256 ASCII letters/digits/`_`/`-` |
 | `WEBHOOK_CERT` | — | TLS certificate (self-managed TLS) |
 | `WEBHOOK_KEY` | — | TLS private key (self-managed TLS) |
 
@@ -178,7 +178,33 @@ docker compose logs -f bot
 docker compose --profile webhook up -d --build
 ```
 
-The SQLite database is persisted in `./data`.
+The SQLite database is persisted in the `bot_data` Docker named volume, mounted
+at `/app/data` and initialized with ownership for the non-root bot user.
+
+### One-time volume migration
+
+Existing `./data` bind-mount contents are **not imported automatically**. Stop
+the old bot and back up its database before migrating. To import
+`./data/bot.db` without overwriting a database already in `bot_data`, and then
+fix the volume ownership, run:
+
+```bash
+docker compose stop bot
+docker compose run --rm --user root \
+  --volume "$PWD/data:/migration:ro" \
+  --entrypoint sh bot \
+  -c 'cp -n /migration/bot.db /app/data/bot.db &&
+      chown -R 10001:10001 /app/data'
+docker compose up -d bot
+```
+
+With the bot stopped, repair ownership of an existing `bot_data` volume without
+importing host data:
+
+```bash
+docker compose run --rm --user root --entrypoint sh bot \
+  -c 'chown -R 10001:10001 /app/data'
+```
 
 ### systemd
 
@@ -196,8 +222,8 @@ python -m pytest -q
 - **Rotate the bot token** if it was ever committed. The original version of
   this repository contained a hardcoded token; revoke it in BotFather.
 - Never commit `.env`; it is ignored by `.gitignore`.
-- In webhook mode always set `WEBHOOK_SECRET` and an unguessable
-  `WEBHOOK_PATH`.
+- In webhook mode use a random `WEBHOOK_SECRET` of 32–256 permitted characters
+  and an unguessable `WEBHOOK_PATH` that exactly matches the URL.
 - Run the bot as an unprivileged user (the Docker image does).
 - Optional: purge the leaked token from git history with `git filter-repo` or
   BFG.

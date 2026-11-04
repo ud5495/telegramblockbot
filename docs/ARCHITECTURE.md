@@ -94,7 +94,9 @@ clean.
 | `ban` | delete + ban |
 
 Violations decay after `VIOLATION_DECAY_SECONDS`; a user who behaves starts
-from strike 1 again.
+from strike 1 again. Message deletion and subsequent enforcement are attempted
+independently because Telegram permissions can differ. Statistics and audit
+messages record the actual deletion and enforcement outcomes separately.
 
 ## Admin cache
 
@@ -106,11 +108,19 @@ from strike 1 again.
 
 When enabled per chat:
 
-1. New members are restricted for `CAPTCHA_TIMEOUT` seconds.
-2. The bot sends a prompt with an inline “I'm human” button.
-3. Pressing it unmutes the member and increments `captcha_passed`.
-4. A repeating job sweeps expired entries and kicks the user (ban + unban)
-   when `CAPTCHA_KICK_ON_TIMEOUT=true`.
+1. A unique attempt is persisted before the new member is restricted. The
+   restriction has no automatic Telegram expiry; it ends only after verification
+   or timeout enforcement.
+2. The bot sends an attempt- and message-bound “I'm human” button. Missing
+   prompts are retried by the sweeper before `CAPTCHA_TIMEOUT` expires.
+3. Pressing the button leases the attempt, restores the chat's default member
+   permissions, and records a persistent post-action state before statistics
+   are finalized. Failed operations remain retryable without reporting success.
+4. Expired attempts are kicked (ban + unban) when
+   `CAPTCHA_KICK_ON_TIMEOUT=true`, or explicitly unrestricted otherwise.
+5. Atomic leases prevent callback/sweeper duplication, while persistent states
+   and legacy-schema upgrades allow recovery after restarts. Successful Telegram
+   actions are not repeated when only database finalization needs a retry.
 
 ## SQLite schema
 
@@ -118,17 +128,26 @@ When enabled per chat:
 - `whitelist` — `(chat_id, kind, value)` where kind is `domain` or `user`.
 - `violations` — strike count, last violation timestamp, mute expiry.
 - `stats` — counters for deleted/warned/muted/banned/captcha.
-- `pending_captcha` — pending verifications and their expiry.
+- `pending_captcha` — attempt identity, prompt, expiry, lifecycle state and
+  retry lease for incomplete verifications.
 
-The database lives at `DB_PATH` (default `data/bot.db`).
+The database lives at `DB_PATH` (default `data/bot.db`). In Docker, `/app/data`
+is backed by the `bot_data` named volume, which is initialized from an image
+directory owned by the non-root bot user (UID 10001). Older `./data` bind-mount
+contents require the documented one-time migration; they are not imported
+automatically.
 
 ## Modes
 
 `Settings.mode` selects the runner in `main.py`:
 
 - **polling** — `Application.run_polling(...)`; no infrastructure.
-- **webhook** — `Application.run_webhook(...)`; requires `WEBHOOK_URL`, optional
-  `WEBHOOK_SECRET`, `WEBHOOK_CERT`/`WEBHOOK_KEY`.
+- **webhook** — `Application.run_webhook(...)`; requires an HTTPS `WEBHOOK_URL`
+  with a hostname, no query/fragment, and a public port in `443, 80, 88, 8443`
+  (omitted means 443), plus a `WEBHOOK_PATH` exactly matching its path.
+  `WEBHOOK_SECRET` must be 32–256 Telegram-approved characters. The local
+  `WEBHOOK_PORT` may be 1–65535. `WEBHOOK_CERT`/`WEBHOOK_KEY` remain optional
+  but must be provided together.
 
 Both use the same handlers, database and job queue, so behaviour is identical.
 

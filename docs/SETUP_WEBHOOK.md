@@ -10,8 +10,10 @@ resource usage, at the cost of needing a public HTTPS endpoint.
 Telegram  ──HTTPS──▶  Caddy/nginx (:443)  ──HTTP──▶  bot (:8443)
 ```
 
-Telegram only delivers webhooks on ports **443, 80, 88 or 8443**. In practice
-you use 443 via a reverse proxy that handles TLS.
+Telegram only delivers webhooks on public ports **443, 80, 88 or 8443**. An
+omitted `WEBHOOK_URL` port defaults to 443; other explicit public ports are
+rejected. In practice you use 443 via a reverse proxy that handles TLS. The
+local `WEBHOOK_PORT` is independent and may be any port from 1 to 65535.
 
 ## Requirements
 
@@ -42,15 +44,18 @@ WEBHOOK_URL=https://bot.example.com/telegram
 WEBHOOK_LISTEN=127.0.0.1
 WEBHOOK_PORT=8443
 WEBHOOK_PATH=/telegram
-WEBHOOK_SECRET=change-me-to-a-long-random-string
+WEBHOOK_SECRET=replace-with-32-or-more-random-characters
 ```
 
-- `WEBHOOK_URL` is the public URL Telegram will call. It must be `https://`.
+- `WEBHOOK_URL` is the public URL Telegram will call. It must use HTTPS, include
+  a hostname, and have no query string or fragment.
+- `WEBHOOK_PATH` must exactly match the path in `WEBHOOK_URL`.
 - `WEBHOOK_LISTEN=127.0.0.1` keeps the bot reachable only from the local proxy.
   Use `0.0.0.0` if the bot itself must be reachable from outside (e.g. in a
-  container).
-- `WEBHOOK_SECRET` is sent by Telegram in the
-  `X-Telegram-Bot-Api-Secret-Token` header and validated by the library.
+  container); this is required for the Compose + Caddy deployment.
+- `WEBHOOK_SECRET` is required and must be 32–256 characters long using only
+  ASCII letters, digits, underscores or hyphens. Telegram sends it in the
+  `X-Telegram-Bot-Api-Secret-Token` header and the library validates it.
 
 Generate a secret:
 
@@ -88,13 +93,15 @@ The repository ships a compose profile that runs the bot and Caddy together:
 # WEBHOOK_LISTEN=0.0.0.0
 # WEBHOOK_PORT=8443
 # WEBHOOK_PATH=/telegram
-# WEBHOOK_SECRET=...
+# WEBHOOK_SECRET=replace-with-32-or-more-random-characters
 # WEBHOOK_DOMAIN=bot.example.com   (read by Caddy)
 docker compose --profile webhook up -d --build
 docker compose logs -f bot caddy
 ```
 
 The `Caddyfile` proxies `{$WEBHOOK_DOMAIN}` to the `bot` service on `8443`.
+Existing `./data` bind-mount contents do not migrate automatically; see the
+[one-time volume migration](../README.md#one-time-volume-migration) if upgrading.
 
 ## 4. Option B — the bot serves TLS itself
 
@@ -107,6 +114,7 @@ WEBHOOK_URL=https://bot.example.com:8443/telegram
 WEBHOOK_LISTEN=0.0.0.0
 WEBHOOK_PORT=8443
 WEBHOOK_PATH=/telegram
+WEBHOOK_SECRET=replace-with-32-or-more-random-characters
 WEBHOOK_CERT=/etc/letsencrypt/live/bot.example.com/fullchain.pem
 WEBHOOK_KEY=/etc/letsencrypt/live/bot.example.com/privkey.pem
 ```
@@ -154,8 +162,10 @@ A healthy response has:
 
 ## 8. Security checklist
 
-- [ ] `WEBHOOK_URL` uses HTTPS with a valid certificate
-- [ ] `WEBHOOK_SECRET` set to a long random value
+- [ ] `WEBHOOK_URL` uses HTTPS with a valid certificate and a supported public
+  port (443 when omitted)
+- [ ] `WEBHOOK_SECRET` is random, 32–256 characters long, and uses only ASCII
+  letters, digits, `_` or `-`
 - [ ] `WEBHOOK_PATH` is hard to guess (e.g. `/telegram/<random>`)
 - [ ] Firewall: only 80/443 exposed; bot port 8443 bound to localhost
 - [ ] Token rotated if it was ever committed

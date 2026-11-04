@@ -67,10 +67,15 @@ WARNING = (
     "⚠️ {name}, your message was removed. Links, mentions and invite links "
     "are not allowed here.\nStrike: {count}"
 )
+WARNING_NOT_DELETED = (
+    "⚠️ {name}, links, mentions and invite links are not allowed here."
+    "\nStrike: {count}"
+)
 CAPTCHA_PROMPT = "👋 Welcome {name}! Please tap the button below within {timeout} seconds to prove you are human."
 CAPTCHA_BUTTON = "✅ I'm human"
 CAPTCHA_PASSED = "✅ Verified. Welcome to the chat!"
 CAPTCHA_EXPIRED = "This verification expired. Please contact an administrator."
+CAPTCHA_RETRY = "Verification is still being processed. Please wait while I retry."
 CAPTCHA_NOT_YOURS = "This verification is not for you."
 CAPTCHA_TIMEOUT_KICK = "⌛ {name} did not verify in time and was removed."
 HEALTH_TEXT = "OK"

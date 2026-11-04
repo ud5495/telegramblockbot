@@ -27,12 +27,15 @@ def settings_keyboard(
     )
 
 
-def captcha_keyboard(chat_id: int, user_id: int) -> InlineKeyboardMarkup:
+def captcha_keyboard(
+    chat_id: int, user_id: int, attempt_id: str
+) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [
                 InlineKeyboardButton(
-                    "✅ I'm human", callback_data=f"captcha:{chat_id}:{user_id}"
+                    "✅ I'm human",
+                    callback_data=f"captcha:{chat_id}:{user_id}:{attempt_id}",
                 )
             ]
         ]

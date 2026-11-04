@@ -124,8 +124,11 @@ docker compose up -d --build
 docker compose logs -f bot
 ```
 
-The SQLite database is persisted in `./data`. Caddy is not started for polling
-because it lives behind the `webhook` profile.
+The SQLite database is persisted in the `bot_data` Docker named volume, mounted
+at `/app/data`. Existing `./data` bind-mount contents do not migrate
+automatically; follow the [one-time volume migration](../README.md#one-time-volume-migration)
+when upgrading. Caddy is not started for polling because it lives behind the
+`webhook` profile.
 
 ## Troubleshooting
 

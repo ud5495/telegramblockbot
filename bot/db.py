@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -48,8 +49,12 @@ CREATE TABLE IF NOT EXISTS stats (
 CREATE TABLE IF NOT EXISTS pending_captcha (
     chat_id INTEGER NOT NULL,
     user_id INTEGER NOT NULL,
+    attempt_id TEXT NOT NULL DEFAULT '',
     message_id INTEGER,
     expires_at REAL NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    lease_until REAL NOT NULL DEFAULT 0,
+    legacy INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (chat_id, user_id)
 );
 """
@@ -89,7 +94,47 @@ class Database:
         self._conn = await aiosqlite.connect(self.path)
         self._conn.row_factory = aiosqlite.Row
         await self._conn.executescript(SCHEMA)
+        await self._ensure_captcha_schema()
         await self._conn.commit()
+
+    async def _ensure_captcha_schema(self) -> None:
+        """Add captcha recovery fields to databases created by older versions."""
+        cursor = await self.connection.execute("PRAGMA table_info(pending_captcha)")
+        try:
+            columns = {row["name"] for row in await cursor.fetchall()}
+        finally:
+            await cursor.close()
+
+        added_columns = {
+            "attempt_id": "TEXT NOT NULL DEFAULT ''",
+            "status": "TEXT NOT NULL DEFAULT 'pending'",
+            "lease_until": "REAL NOT NULL DEFAULT 0",
+            "legacy": "INTEGER NOT NULL DEFAULT 0",
+        }
+        for name, definition in added_columns.items():
+            if name not in columns:
+                await self.connection.execute(
+                    f"ALTER TABLE pending_captcha ADD COLUMN {name} {definition}"
+                )
+
+        await self.connection.execute(
+            "UPDATE pending_captcha SET status = 'pending' "
+            "WHERE status IS NULL OR status = ''"
+        )
+        cursor = await self.connection.execute(
+            "SELECT chat_id, user_id FROM pending_captcha "
+            "WHERE attempt_id IS NULL OR attempt_id = ''"
+        )
+        try:
+            rows = list(await cursor.fetchall())
+        finally:
+            await cursor.close()
+        for row in rows:
+            await self.connection.execute(
+                "UPDATE pending_captcha SET attempt_id = ?, legacy = 1 "
+                "WHERE chat_id = ? AND user_id = ?",
+                (uuid.uuid4().hex[:16], row["chat_id"], row["user_id"]),
+            )
 
     async def close(self) -> None:
         if self._conn is not None:
@@ -263,12 +308,34 @@ class Database:
     # --------------------------------------------------------------- captcha
     async def add_pending_captcha(
         self, chat_id: int, user_id: int, message_id: int | None, expires_at: float
-    ) -> None:
+    ) -> str:
+        attempt_id = uuid.uuid4().hex[:16]
+        lease_until = time.time() + 60 if message_id is None else 0
         await self._execute(
-            "INSERT OR REPLACE INTO pending_captcha (chat_id, user_id, message_id, expires_at) "
-            "VALUES (?, ?, ?, ?)",
-            (chat_id, user_id, message_id, expires_at),
+            "INSERT OR REPLACE INTO pending_captcha "
+            "(chat_id, user_id, attempt_id, message_id, expires_at, status, "
+            "lease_until, legacy) VALUES (?, ?, ?, ?, ?, 'pending', ?, 0)",
+            (
+                chat_id,
+                user_id,
+                attempt_id,
+                message_id,
+                expires_at,
+                lease_until,
+            ),
         )
+        return attempt_id
+
+    async def set_pending_captcha_message(
+        self, chat_id: int, user_id: int, attempt_id: str, message_id: int
+    ) -> bool:
+        rowcount = await self._execute(
+            "UPDATE pending_captcha SET message_id = ?, lease_until = 0 "
+            "WHERE chat_id = ? AND user_id = ? AND attempt_id = ? "
+            "AND status = 'pending'",
+            (message_id, chat_id, user_id, attempt_id),
+        )
+        return rowcount > 0
 
     async def get_pending_captcha(
         self, chat_id: int, user_id: int
@@ -279,6 +346,154 @@ class Database:
         )
         return dict(row) if row else None
 
+    async def claim_captcha_prompt(
+        self,
+        chat_id: int,
+        user_id: int,
+        attempt_id: str,
+        now: float,
+        lease_until: float | None = None,
+    ) -> bool:
+        lease_until = now + 60 if lease_until is None else lease_until
+        rowcount = await self._execute(
+            "UPDATE pending_captcha SET lease_until = ? "
+            "WHERE chat_id = ? AND user_id = ? AND attempt_id = ? "
+            "AND status = 'pending' AND message_id IS NULL AND expires_at > ? "
+            "AND lease_until <= ?",
+            (lease_until, chat_id, user_id, attempt_id, now, now),
+        )
+        return rowcount > 0
+
+    async def claim_captcha_pass(
+        self,
+        chat_id: int,
+        user_id: int,
+        attempt_id: str,
+        now: float,
+        lease_until: float | None = None,
+    ) -> bool:
+        """Atomically lease a new pass or a stale passing retry."""
+        lease_until = now + 60 if lease_until is None else lease_until
+        rowcount = await self._execute(
+            "UPDATE pending_captcha SET status = 'passing', lease_until = ? "
+            "WHERE chat_id = ? AND user_id = ? AND attempt_id = ? "
+            "AND (status = 'passing' "
+            "OR (status = 'pending' AND message_id IS NOT NULL AND expires_at > ?)) "
+            "AND lease_until <= ?",
+            (lease_until, chat_id, user_id, attempt_id, now, now),
+        )
+        return rowcount > 0
+
+    async def mark_captcha_expired(
+        self,
+        chat_id: int,
+        user_id: int,
+        attempt_id: str,
+        now: float,
+        lease_until: float | None = None,
+    ) -> bool:
+        """Atomically lease new timeout enforcement or a stale expired retry."""
+        lease_until = now + 60 if lease_until is None else lease_until
+        rowcount = await self._execute(
+            "UPDATE pending_captcha SET status = 'expired', lease_until = ? "
+            "WHERE chat_id = ? AND user_id = ? AND attempt_id = ? "
+            "AND (status = 'expired' OR (status = 'pending' AND expires_at <= ?)) "
+            "AND lease_until <= ?",
+            (lease_until, chat_id, user_id, attempt_id, now, now),
+        )
+        return rowcount > 0
+
+    async def release_captcha_lease(
+        self, chat_id: int, user_id: int, attempt_id: str, status: str
+    ) -> bool:
+        rowcount = await self._execute(
+            "UPDATE pending_captcha SET lease_until = 0 "
+            "WHERE chat_id = ? AND user_id = ? AND attempt_id = ? AND status = ?",
+            (chat_id, user_id, attempt_id, status),
+        )
+        return rowcount > 0
+
+    async def mark_captcha_passed(
+        self, chat_id: int, user_id: int, attempt_id: str
+    ) -> bool:
+        rowcount = await self._execute(
+            "UPDATE pending_captcha SET status = 'passed', lease_until = 0 "
+            "WHERE chat_id = ? AND user_id = ? AND attempt_id = ? "
+            "AND status = 'passing'",
+            (chat_id, user_id, attempt_id),
+        )
+        return rowcount > 0
+
+    async def mark_captcha_enforced(
+        self, chat_id: int, user_id: int, attempt_id: str
+    ) -> bool:
+        rowcount = await self._execute(
+            "UPDATE pending_captcha SET status = 'enforced', lease_until = 0 "
+            "WHERE chat_id = ? AND user_id = ? AND attempt_id = ? "
+            "AND status = 'expired'",
+            (chat_id, user_id, attempt_id),
+        )
+        return rowcount > 0
+
+    async def complete_captcha_pass(
+        self, chat_id: int, user_id: int, attempt_id: str
+    ) -> bool:
+        return await self._complete_captcha(
+            chat_id, user_id, attempt_id, "passed", "captcha_passed"
+        )
+
+    async def complete_captcha_failure(
+        self, chat_id: int, user_id: int, attempt_id: str
+    ) -> bool:
+        return await self._complete_captcha(
+            chat_id, user_id, attempt_id, "enforced", "captcha_failed"
+        )
+
+    async def _complete_captcha(
+        self,
+        chat_id: int,
+        user_id: int,
+        attempt_id: str,
+        status: str,
+        stat_field: str,
+    ) -> bool:
+        """Remove a completed attempt and count it in the same transaction."""
+        if stat_field not in STAT_COLUMNS:
+            raise ValueError(f"Unknown stat field: {stat_field}")
+        async with self._lock:
+            try:
+                cursor = await self.connection.execute(
+                    "DELETE FROM pending_captcha "
+                    "WHERE chat_id = ? AND user_id = ? AND attempt_id = ? "
+                    "AND status = ?",
+                    (chat_id, user_id, attempt_id, status),
+                )
+                completed = cursor.rowcount > 0
+                await cursor.close()
+                if completed:
+                    cursor = await self.connection.execute(
+                        f"INSERT INTO stats (chat_id, {stat_field}) VALUES (?, 1) "
+                        f"ON CONFLICT(chat_id) DO UPDATE SET "
+                        f"{stat_field} = {stat_field} + 1",
+                        (chat_id,),
+                    )
+                    await cursor.close()
+                await self.connection.commit()
+                return completed
+            except Exception:
+                await self.connection.rollback()
+                raise
+
+    async def remove_captcha_attempt(
+        self, chat_id: int, user_id: int, attempt_id: str
+    ) -> bool:
+        rowcount = await self._execute(
+            "DELETE FROM pending_captcha "
+            "WHERE chat_id = ? AND user_id = ? AND attempt_id = ?",
+            (chat_id, user_id, attempt_id),
+        )
+        return rowcount > 0
+
     async def remove_pending_captcha(self, chat_id: int, user_id: int) -> bool:
         rowcount = await self._execute(
             "DELETE FROM pending_captcha WHERE chat_id = ? AND user_id = ?",
@@ -287,7 +502,12 @@ class Database:
         return rowcount > 0
 
     async def expired_captchas(self, now: float) -> list[dict[str, Any]]:
+        """Return attempts needing prompts, API actions, or DB finalization."""
         rows = await self._fetchall(
-            "SELECT * FROM pending_captcha WHERE expires_at <= ?", (now,)
+            "SELECT * FROM pending_captcha "
+            "WHERE status IN ('passing', 'passed', 'expired', 'enforced') "
+            "OR (status = 'pending' AND (expires_at <= ? OR message_id IS NULL)) "
+            "ORDER BY expires_at",
+            (now,),
         )
         return [dict(row) for row in rows]

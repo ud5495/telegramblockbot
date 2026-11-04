@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import os
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from dotenv import load_dotenv
 
 VALID_MODES = {"polling", "webhook"}
 VALID_ACTIONS = {"delete", "warn", "mute", "ban"}
+TELEGRAM_WEBHOOK_PORTS = {80, 88, 443, 8443}
 
 
 class ConfigError(RuntimeError):
@@ -131,8 +134,32 @@ def load_settings(env: Mapping[str, str] | None = None) -> Settings:
     if settings.mode == "webhook":
         if not settings.webhook_url:
             raise ConfigError("WEBHOOK_URL is required when MODE=webhook")
-        if not settings.webhook_url.startswith("https://"):
-            raise ConfigError("WEBHOOK_URL must start with https://")
+        try:
+            parsed_url = urlsplit(settings.webhook_url)
+            hostname = parsed_url.hostname
+            url_port = 443 if parsed_url.port is None else parsed_url.port
+        except ValueError as exc:
+            raise ConfigError("WEBHOOK_URL must be a valid HTTPS URL") from exc
+        if parsed_url.scheme != "https" or not hostname:
+            raise ConfigError("WEBHOOK_URL must be HTTPS and include a hostname")
+        if url_port not in TELEGRAM_WEBHOOK_PORTS:
+            raise ConfigError(
+                "WEBHOOK_URL port must be 443, 80, 88, or 8443; omitted ports "
+                "default to 443"
+            )
+        if "?" in settings.webhook_url or "#" in settings.webhook_url:
+            raise ConfigError("WEBHOOK_URL must not contain a query or fragment")
+        if settings.webhook_path != parsed_url.path:
+            raise ConfigError("WEBHOOK_PATH must exactly match the WEBHOOK_URL path")
+        if not settings.webhook_secret:
+            raise ConfigError("WEBHOOK_SECRET is required when MODE=webhook")
+        if re.fullmatch(r"[A-Za-z0-9_-]{32,256}", settings.webhook_secret) is None:
+            raise ConfigError(
+                "WEBHOOK_SECRET must be between 32 and 256 characters and contain "
+                "only ASCII letters, digits, underscores, and hyphens"
+            )
+        if not 1 <= settings.webhook_port <= 65535:
+            raise ConfigError("WEBHOOK_PORT must be between 1 and 65535")
         if bool(settings.webhook_cert) != bool(settings.webhook_key):
             raise ConfigError("WEBHOOK_CERT and WEBHOOK_KEY must be set together")
 

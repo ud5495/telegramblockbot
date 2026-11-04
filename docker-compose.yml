@@ -5,7 +5,7 @@ services:
       - .env
     restart: unless-stopped
     volumes:
-      - ./data:/app/data
+      - bot_data:/app/data
     # Only reachable by the caddy service in webhook mode.
     expose:
       - "8443"
@@ -29,5 +29,6 @@ services:
       - caddy_config:/config
 
 volumes:
+  bot_data:
   caddy_data:
   caddy_config:

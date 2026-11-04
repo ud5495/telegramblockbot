@@ -58,18 +58,24 @@ async def _process(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     spam = context.application.bot_data["spam_tracker"].check(chat.id, user.id, text)
     if spam is not None:
-        await _delete(message, context)
+        deleted = await _delete(message, context)
+        if deleted:
+            await db.increment_stat(chat.id, "deleted")
         if spam == "flood":
-            await _mute(context, db, chat, user.id, settings.mute_seconds)
+            muted = await _mute(context, db, chat, user.id, settings.mute_seconds)
+            deletion_text = "removed message" if deleted else "could not remove message"
             await audit(
                 context,
-                f"Anti-flood: muted user {user.id} in chat {chat.id}",
+                f"Anti-flood: {deletion_text} from user {user.id} in chat {chat.id} "
+                f"(deletion={'success' if deleted else 'failed'}, action=mute, "
+                f"enforcement={'success' if muted else 'failed'})",
             )
         else:
-            await db.increment_stat(chat.id, "deleted")
+            deletion_text = "removed" if deleted else "could not be removed"
             await audit(
                 context,
-                f"Duplicate message removed from user {user.id} in chat {chat.id}",
+                f"Duplicate message {deletion_text} from user {user.id} "
+                f"in chat {chat.id}",
             )
         return
 
@@ -79,7 +85,9 @@ async def _process(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not findings:
         return
 
-    await _delete(message, context)
+    deleted = await _delete(message, context)
+    if deleted:
+        await db.increment_stat(chat.id, "deleted")
 
     count = await db.record_violation(
         chat.id, user.id, settings.violation_decay_seconds
@@ -89,20 +97,27 @@ async def _process(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
     reason = ", ".join(finding.as_reason() for finding in findings[:3])
 
+    enforcement_succeeded = deleted
     if action == "warn":
-        await db.increment_stat(chat.id, "warned")
-        await _send_warning(context, chat.id, user, count)
+        enforcement_succeeded = await _send_warning(
+            context, chat.id, user, count, message_deleted=deleted
+        )
+        if enforcement_succeeded:
+            await db.increment_stat(chat.id, "warned")
     elif action == "mute":
-        await _mute(context, db, chat, user.id, settings.mute_seconds)
+        enforcement_succeeded = await _mute(
+            context, db, chat, user.id, settings.mute_seconds
+        )
     elif action == "ban":
-        await _ban(context, db, chat.id, user.id)
-    else:
-        await db.increment_stat(chat.id, "deleted")
+        enforcement_succeeded = await _ban(context, db, chat.id, user.id)
 
+    deletion_text = "Removed message" if deleted else "Could not remove message"
     await audit(
         context,
-        f"Removed message from user {user.id} in chat {chat.id} "
-        f"(action={action}, strike={count}, findings={reason})",
+        f"{deletion_text} from user {user.id} in chat {chat.id} "
+        f"(action={action}, deletion={'success' if deleted else 'failed'}, "
+        f"enforcement={'success' if enforcement_succeeded else 'failed'}, "
+        f"strike={count}, findings={reason})",
     )
 
 
@@ -114,48 +129,56 @@ async def _is_whitelisted_user(
     return bool(username and await db.is_whitelisted(chat_id, "user", username.lower()))
 
 
-async def _delete(message, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def _delete(message, context: ContextTypes.DEFAULT_TYPE) -> bool:
     try:
         await message.delete()
     except TelegramError as exc:
         logger.warning("Could not delete message %s: %s", message.message_id, exc)
+        return False
+    return True
 
 
-async def _mute(context, db, chat, user_id: int, seconds: int) -> None:
+async def _mute(context, db, chat, user_id: int, seconds: int) -> bool:
     try:
         await moderation.mute_user(context.bot, chat.id, user_id, seconds)
     except TelegramError as exc:
         logger.warning("Could not mute user %s in chat %s: %s", user_id, chat.id, exc)
-        return
+        return False
     await db.set_muted_until(chat.id, user_id, time.time() + seconds)
     await db.increment_stat(chat.id, "muted")
+    return True
 
 
-async def _ban(context, db, chat_id: int, user_id: int) -> None:
+async def _ban(context, db, chat_id: int, user_id: int) -> bool:
     try:
         await moderation.ban_user(context.bot, chat_id, user_id)
     except TelegramError as exc:
         logger.warning("Could not ban user %s in chat %s: %s", user_id, chat_id, exc)
-        return
+        return False
     await db.increment_stat(chat_id, "banned")
+    return True
 
 
-async def _send_warning(context, chat_id: int, user, count: int) -> None:
+async def _send_warning(
+    context, chat_id: int, user, count: int, message_deleted: bool = True
+) -> bool:
+    warning = messages.WARNING if message_deleted else messages.WARNING_NOT_DELETED
     try:
         sent = await context.bot.send_message(
             chat_id=chat_id,
-            text=messages.WARNING.format(name=user.mention_html(), count=count),
+            text=warning.format(name=user.mention_html(), count=count),
             parse_mode="HTML",
         )
     except TelegramError as exc:
         logger.warning("Could not send warning in chat %s: %s", chat_id, exc)
-        return
+        return False
     if context.job_queue is not None:
         context.job_queue.run_once(
             _delete_later,
             when=_AUTO_DELETE_SECONDS,
             data=(sent.chat_id, sent.message_id),
         )
+    return True
 
 
 async def _delete_later(context: ContextTypes.DEFAULT_TYPE) -> None:

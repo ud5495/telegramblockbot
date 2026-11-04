@@ -1,8 +1,8 @@
 # Examples
 
-Two minimal, self-contained bots that show the two ways of receiving updates
-from Telegram. They do not import the `bot/` package on purpose, so you can read
-them end to end.
+Two minimal bots that show the two ways of receiving updates from Telegram.
+The webhook example reuses the project's configuration validation; run it as a
+module from the repository root so the `bot/` package is importable.
 
 | File | Mode | Needs |
 | --- | --- | --- |
@@ -23,15 +23,18 @@ The bot long-polls Telegram. Works behind NAT and needs no domain.
 ```bash
 export BOT_TOKEN="123456:your-token"
 export WEBHOOK_URL="https://bot.example.com/telegram"
-export WEBHOOK_SECRET="a-long-random-string"
+export WEBHOOK_SECRET="replace-with-32-or-more-random-characters"
 export WEBHOOK_PORT=8443
 export WEBHOOK_PATH=/telegram
-python examples/webhook.py
+python -m examples.webhook
 ```
 
-Telegram must be able to reach `WEBHOOK_URL` over HTTPS on port 443, 80, 88 or
-8443. Use Caddy/nginx as a reverse proxy (see `docs/SETUP_WEBHOOK.md`) or pass
-`WEBHOOK_CERT`/`WEBHOOK_KEY` to let the bot serve TLS itself.
+Telegram must be able to reach `WEBHOOK_URL` over HTTPS on public port 443, 80,
+88 or 8443; an omitted port defaults to 443. `WEBHOOK_PATH` must exactly match
+the URL path, and `WEBHOOK_SECRET` must be 32–256 characters using only ASCII
+letters, digits, underscores and hyphens. Use Caddy/nginx as a reverse proxy
+(see `docs/SETUP_WEBHOOK.md`) or pass `WEBHOOK_CERT`/`WEBHOOK_KEY` to let the bot
+serve TLS itself.
 
 ## Switching modes
 

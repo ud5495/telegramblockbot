@@ -4,7 +4,6 @@ import time
 from collections import defaultdict, deque
 
 from telegram import Bot, ChatPermissions
-from telegram.error import TelegramError
 
 
 def choose_action(base_action: str, violation_count: int, warn_limit: int) -> str:
@@ -81,11 +80,25 @@ async def mute_user(bot: Bot, chat_id: int, user_id: int, seconds: int) -> None:
     )
 
 
-async def unmute_user(bot: Bot, chat_id: int, user_id: int) -> None:
+async def mute_captcha_user(bot: Bot, chat_id: int, user_id: int) -> None:
+    """Restrict until captcha completion; Telegram must not auto-unmute at expiry."""
     await bot.restrict_chat_member(
         chat_id=chat_id,
         user_id=user_id,
-        permissions=ChatPermissions.all_permissions(),
+        permissions=ChatPermissions(can_send_messages=False),
+    )
+
+
+async def unmute_user(bot: Bot, chat_id: int, user_id: int) -> None:
+    chat = await bot.get_chat(chat_id)
+    permissions = chat.permissions
+    if permissions is None:
+        # Grant sending only when Telegram does not expose the chat defaults.
+        permissions = ChatPermissions(can_send_messages=True)
+    await bot.restrict_chat_member(
+        chat_id=chat_id,
+        user_id=user_id,
+        permissions=permissions,
     )
 
 
@@ -94,15 +107,10 @@ async def ban_user(bot: Bot, chat_id: int, user_id: int) -> None:
 
 
 async def kick_user(bot: Bot, chat_id: int, user_id: int) -> None:
-    """Kick a user (ban followed by an immediate unban)."""
-    try:
-        await bot.ban_chat_member(
-            chat_id=chat_id, user_id=user_id, revoke_messages=False
-        )
-    finally:
-        try:
-            await bot.unban_chat_member(
-                chat_id=chat_id, user_id=user_id, only_if_banned=True
-            )
-        except TelegramError:
-            pass
+    """Kick a user, propagating ban or unban failures for a later retry."""
+    await bot.ban_chat_member(
+        chat_id=chat_id, user_id=user_id, revoke_messages=False
+    )
+    await bot.unban_chat_member(
+        chat_id=chat_id, user_id=user_id, only_if_banned=True
+    )
